@@ -166,7 +166,7 @@ shape over a `T | null` return. Forces callers to branch.
 
 ```ts
 type Result<T> = { ok: true; value: T } | { ok: false; error: string };
-```
+
 
 ## Pattern 2 — `satisfies` over `as`
 For const objects, `satisfies` preserves narrowing where `as` erases it.
