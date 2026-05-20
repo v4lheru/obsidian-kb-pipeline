@@ -1,0 +1,40 @@
+# config/domains.example.yaml — generic developer-relevant taxonomy.
+#
+# Copy this file to `config/domains.yaml` and edit for your own projects.
+# Pipeline merges your entries on top of built-in defaults; you do not need
+# to repeat any keyword already known to the built-ins (n8n, supabase,
+# typescript, react, postgres, mcp, docker, kubernetes, gcp, slack, etc.).
+
+# Map a substring in your Claude Code project directory name to a domain
+# label. Domain labels are arbitrary slugs you pick; they show up in
+# generated wiki pages and drive routing.
+project_domain_patterns:
+  - keyword: "my-app"
+    domain: "my-app"
+  - keyword: "client-work"
+    domain: "client-work"
+
+# Domains with dedicated clusterer routes. Listing a domain here is only
+# needed when it is NOT also in topic_page_map below (which auto-flags it).
+specific_domain_topics: []
+
+# Classifier topic -> clusterer canonical topic. Alias your project domains
+# onto a generic clusterer category. Built-in categories include n8n,
+# supabase, frontend, backend, database, auth, security, devops.
+topic_canonicalization:
+  my-app: "backend"
+
+# Keyword-in-text -> canonical topic. Detects project-specific terminology
+# in your session transcripts and routes it to a topic.
+topic_keywords: []
+
+# Override clusterer routing for a topic.
+topic_page_map: {}
+
+# Keyword -> wiki page filename (no extension). Drives [[wikilink]] auto-population.
+wikilink_targets: {}
+
+# Strip these path components when humanizing project_dir strings.
+# Add your macOS short username and any folder names personal to your setup.
+path_skip_prefixes:
+  - "alice"

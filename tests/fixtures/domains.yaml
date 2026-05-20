@@ -1,0 +1,10 @@
+# tests/fixtures/domains.yaml — minimal fixture for load_domain_config tests.
+project_domain_patterns:
+  - keyword: "fixture-app"
+    domain: "fixture-domain"
+
+topic_canonicalization:
+  fixture-domain: "backend"
+
+path_skip_prefixes:
+  - "alice"

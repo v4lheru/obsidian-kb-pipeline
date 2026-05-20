@@ -1,0 +1,14 @@
+[project]
+name = "obsidian-kb-pipeline"
+version = "1.0.0"
+description = "LLM Wiki knowledge pipeline – distills Claude Code memory into Obsidian wiki pages"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.40.0"]
+
+[project.scripts]
+obsidian-kb-pipeline = "src.pipeline:main"

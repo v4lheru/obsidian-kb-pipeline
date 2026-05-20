@@ -1,0 +1,78 @@
+# Minimal stub — backend-coder. Devops-engineer will expand at step 12
+# with the full GitHub Python.gitignore + cross-platform additions.
+
+# Python bytecode + test cache
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+
+# Project runtime artifacts
+state.db
+state.db-journal
+logs/*
+!logs/.gitkeep
+*.log
+
+# User secrets and user-specific config
+.env
+config/domains.yaml
+
+# Local-only overrides
+*.local.*
+
+# OS
+.DS_Store
+
+# === devops-engineer layered additions ===
+
+# Python — GitHub's recommended Python.gitignore (additions to stub above)
+*$py.class
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Type checkers and linters
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+.tox/
+.nox/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Node (defensive — repo is Python-only but operator may have tools here)
+node_modules/
+
+# Claude Code session state (defensive — operator artifact, never belongs in repo)
+.claude/
+
+# Operator artifacts
+*.tmp
+*.bak
+
+# OS — Windows counterpart to .DS_Store
+Thumbs.db
