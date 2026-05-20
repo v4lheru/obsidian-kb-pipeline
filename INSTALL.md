@@ -31,6 +31,8 @@ Edit `config/domains.yaml` if you want custom project domain routing. For a firs
 
 The pipeline writes into `${VAULT_ROOT}/${VAULT_NOTES_SUBPATH}` (default subpath: `Coding-Notes`). It creates the subpath if it does not exist.
 
+The wiki index (Map of Content) lands at `${VAULT_ROOT}/${VAULT_NOTES_SUBPATH}/coding-knowledge-map.md` — this is the file you point your Claude agents at. See [README — Closing the loop](README.md#closing-the-loop--wire-the-wiki-back-into-claude) for the exact `~/.claude/CLAUDE.md` snippet that wires the wiki into every dispatched agent.
+
 ## Cadence A — manual / on demand
 
 Two wrappers, both self-locating (no hardcoded paths):

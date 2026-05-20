@@ -139,6 +139,24 @@ The pipeline runs in eight stages, each implemented as a single module in `src/`
 
 State for incremental runs lives in `state.db` (SQLite) managed by `src/state_store.py`. Pages exceeding `SynthesisConfig.max_page_words` (default 3000) are not appended to; new findings are deferred to a subsequent quality-check report (`src/quality_check.py`).
 
+## Closing the loop — wire the wiki back into Claude
+
+The pipeline only handles the *write* side of the loop: sessions → wiki. To close the loop and have Claude actually consult the wiki before working, add one instruction to your global `~/.claude/CLAUDE.md`:
+
+````markdown
+## Obsidian Knowledge Base (LLM Wiki)
+
+When dispatching agents, include in their prompt:
+"Before starting, read `<your-vault>/Coding-Notes/coding-knowledge-map.md`
+for existing wiki knowledge on your topic. Read any relevant pages — they
+contain distilled API quirks, architecture decisions, gotchas, and patterns
+from prior sessions."
+````
+
+The pipeline auto-maintains `coding-knowledge-map.md` (the MOC — Map of Content) as the wiki index. Agents read the MOC, follow `[[wikilinks]]` to relevant pages, and the loop compounds. Without this snippet you have a wiki that gets written but never read.
+
+The MOC lives at `${VAULT_ROOT}/${VAULT_NOTES_SUBPATH}/coding-knowledge-map.md` (default subpath: `Coding-Notes`). Substitute the literal path into the snippet above, or leave the relative form if your global `CLAUDE.md` expands `${VAULT_ROOT}` for you.
+
 ## Example output
 
 A page the pipeline might produce for the topic "typescript strict-null patterns":
