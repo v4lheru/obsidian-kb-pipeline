@@ -11,7 +11,7 @@ The loop:
 
 ## What it does
 
-The pipeline reads Claude Code JSONL session transcripts from `~/.claude/projects/`, PACT memory from `~/.claude/pact-memory/`, and agent memory from `~/.claude/agent-memory/`. It scrubs credentials, applies a heuristic value-score filter, extracts what survives into structured findings, clusters them by topic, and writes organized markdown pages into your Obsidian vault. State lives in a local SQLite cache (`state.db`) so subsequent runs are incremental — sessions and memory entries that have already been processed are skipped.
+The pipeline reads Claude Code JSONL session transcripts from `~/.claude/projects/`, [PACT memory](https://github.com/Synaptic-Labs-AI/PACT-Plugin) from `~/.claude/pact-memory/`, and agent memory from `~/.claude/agent-memory/`. It scrubs credentials, applies a heuristic value-score filter, extracts what survives into structured findings, clusters them by topic, and writes organized markdown pages into your Obsidian vault. State lives in a local SQLite cache (`state.db`) so subsequent runs are incremental — sessions and memory entries that have already been processed are skipped.
 
 ## Architecture
 
@@ -215,6 +215,10 @@ This pipeline writes autonomously and keeps extractions forever. Known gaps:
 - **macOS-only scheduling.** `launchd` is the only built-in scheduler. Linux users wire up `systemd-timer` or `cron`; the pipeline core is platform-agnostic.
 
 Issues and PRs welcome.
+
+## Related projects
+
+- [PACT-Plugin](https://github.com/Synaptic-Labs-AI/PACT-Plugin) — Synaptic Labs' orchestration harness for Claude Code. Optional but recommended: PACT's secretary persona harvests session HANDOFFs into structured `~/.claude/pact-memory/` entries, which is the densest input source this pipeline can read. Without PACT you still get session JSONL distillation + `~/.claude/agent-memory/` + project `CLAUDE.md` ingestion — PACT simply adds the deepest "agents-talking-to-future-agents" layer.
 
 ## Credits
 
