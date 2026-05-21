@@ -87,13 +87,27 @@ class TestOutputQuality(unittest.TestCase):
         self.assertIn("Content paragraph.", rendered)
 
     def test_multi_extraction_page_readability(self):
-        """A page with 5 diverse extractions should be readable."""
+        """A page with 5 diverse extractions should be readable.
+
+        Contents are intentionally distinct topics so v1.1.0 intra-batch
+        semantic dedup keeps all five (dedup collapses paraphrases, not
+        legitimately different content).
+        """
+        contents = [
+            "Always test event handlers in isolation before integration",
+            "Choose PostgreSQL when transactional consistency outweighs sharding",
+            "PaymentGateway encapsulates Stripe, Adyen, and Braintree adapters",
+            "Migrate one table at a time during major schema overhauls",
+            "Decide retry policy at job-creation time rather than at consumer time",
+        ]
         extractions = [
             Extraction(id=str(i), source_id="s1", source_type="pact_memory",
                        extraction_type=etype, topic="test",
-                       title=f"Title {i}", content=f"Detailed content about aspect {i} of the system",
+                       title=f"Title {i}", content=content,
                        context="Test Project")
-            for i, etype in enumerate(["lesson", "decision", "entity", "lesson", "decision"])
+            for i, (etype, content) in enumerate(zip(
+                ["lesson", "decision", "entity", "lesson", "decision"], contents,
+            ))
         ]
         candidate = self._make_realistic_candidate("test", extractions)
         page = synthesize_page(candidate)

@@ -9,6 +9,7 @@ dependencies = [
 
 [project.optional-dependencies]
 llm = ["anthropic>=0.40.0"]
+embeddings = ["model2vec>=0.3.0"]
 
 [project.scripts]
 obsidian-kb-pipeline = "src.pipeline:main"

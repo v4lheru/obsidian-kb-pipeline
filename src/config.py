@@ -88,6 +88,21 @@ class SynthesisConfig:
     # and logged so they surface in the next quality-check report.
     max_page_words: int = 3000
 
+    # v1.1.0: drift detection master switch. When True, page-merge runs an
+    # LLM drift check that annotates contradictions as HTML comments. Falls
+    # back to additive-only merge whenever the LLM call is unavailable.
+    drift_check_enabled: bool = True
+
+    # v1.1.0: semantic-dedup master switch. When True, a second-pass embedding
+    # comparison runs after the existing exact/prefix dedup. Falls back to
+    # v1.0.0 dedup when model2vec is not installed.
+    semantic_dedup_enabled: bool = True
+
+    # v1.1.0: cosine cutoff above which a new extraction is treated as a
+    # paraphrase of an existing chunk. Strict `>` -- equality keeps the
+    # candidate. Range [0, 1].
+    semantic_dedup_threshold: float = 0.86
+
 
 @dataclass(frozen=True)
 class SessionConfig:
@@ -96,6 +111,15 @@ class SessionConfig:
     min_value_score: int = 3          # minimum classifier score to extract
     min_messages: int = 5             # minimum messages after filtering
     max_chunk_chars: int = 50_000     # max chars per text chunk
+
+
+@dataclass(frozen=True)
+class PruneConfig:
+    """Defaults for the v1.1.0 rot-pruning subcommand."""
+
+    # Number of recent runs that protect an extraction from pruning. ~3
+    # months at a weekly schedule. Override per-invocation with --keep-runs.
+    default_keep_runs: int = 12
 
 
 @dataclass(frozen=True)
@@ -108,4 +132,5 @@ class PipelineConfig:
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     synthesis: SynthesisConfig = field(default_factory=SynthesisConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
+    prune: PruneConfig = field(default_factory=PruneConfig)
     # Phase 2 uses template-based synthesis only (no LLM API calls).

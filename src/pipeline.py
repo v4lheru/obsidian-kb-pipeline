@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from .classifier import SessionClassification, classify_session
 from .clusterer import cluster_extractions
 from .config import PipelineConfig
+from .diff_report import print_diff_report
 from .domains import load_domain_config, set_domain_config
 from .jsonl_parser import discover_sessions
 from .memory_reader import read_agent_memory, read_pact_memory, read_project_memory
@@ -36,6 +37,7 @@ from .quality_check import (
     quality_fix,
     run_quality_check,
 )
+from .run_prune import format_report as _format_prune_report, run_prune
 from .session_extractor import extract_session
 from .state_store import Extraction, PipelineRun, StateStore, WikiPageRecord
 from .synthesizer import WikiPage, synthesize_page
@@ -48,7 +50,10 @@ logger = logging.getLogger(__name__)
 # Phase 1: Memory pipeline
 # ---------------------------------------------------------------------------
 
-def run_memory_pipeline(config: PipelineConfig) -> dict[str, int]:
+def run_memory_pipeline(
+    config: PipelineConfig,
+    dry_run_mode: str | None = None,
+) -> dict[str, int]:
     """Execute the Phase 1 memory-only pipeline.
 
     Steps:
@@ -58,6 +63,11 @@ def run_memory_pipeline(config: PipelineConfig) -> dict[str, int]:
       4. Write pages to vault
       5. Update MOC
       6. Record state
+
+    v1.1.0: when `dry_run_mode == "diff"`, run through synthesis but skip all
+    write / MOC / state operations, printing a unified-diff report against
+    the on-disk vault content. The run_id row is also rolled back so a
+    re-run reproduces identical output.
 
     Returns summary stats dict.
     """
@@ -105,9 +115,23 @@ def run_memory_pipeline(config: PipelineConfig) -> dict[str, int]:
         pages: list[WikiPage] = []
         for candidate in candidates:
             page = synthesize_page(
-                candidate, max_page_words=config.synthesis.max_page_words
+                candidate,
+                max_page_words=config.synthesis.max_page_words,
+                semantic_dedup_enabled=config.synthesis.semantic_dedup_enabled,
+                semantic_dedup_threshold=config.synthesis.semantic_dedup_threshold,
+                drift_check_enabled=config.synthesis.drift_check_enabled,
             )
             pages.append(page)
+
+        # v1.1.0: diff-mode dry-run short-circuits here.
+        # Nothing is written: no vault files, no MOC, no state.db rows.
+        if dry_run_mode == "diff":
+            _emit_diff_report(pages, config)
+            return {
+                "extractions": len(all_extractions),
+                "pages_created": 0,
+                "pages_updated": 0,
+            }
 
         # Step 4: Write pages to vault
         logger.info("=== Step 4: Writing wiki pages ===")
@@ -126,7 +150,7 @@ def run_memory_pipeline(config: PipelineConfig) -> dict[str, int]:
 
         # Step 7: Record state
         logger.info("=== Step 7: Recording state ===")
-        store.save_extractions(all_extractions)
+        store.save_extractions(all_extractions, run_id_int=run.run_id_int)
         for page in pages:
             store.save_wiki_page(WikiPageRecord(
                 page_path=page.path,
@@ -135,6 +159,14 @@ def run_memory_pipeline(config: PipelineConfig) -> dict[str, int]:
                 extraction_ids=page.extraction_ids,
                 word_count=page.word_count,
             ))
+
+        # Stamp every extraction seen this run with the current ordinal so
+        # the next prune sees them as confirmed. Sits between save_extractions
+        # and finish_run so a crash here leaves the run row in-flight, which
+        # the prune subcommand correctly detects as "refuse to run".
+        store.touch_extractions(
+            [e.id for e in all_extractions], run.run_id_int
+        )
 
         pages_created = sum(1 for p in pages if p.is_new)
         pages_updated = sum(1 for p in pages if not p.is_new)
@@ -170,16 +202,18 @@ def run_session_pipeline(
     config: PipelineConfig,
     project_filter: str | None = None,
     dry_run: bool = False,
+    dry_run_mode: str | None = None,
 ) -> dict[str, int]:
     """Execute the Phase 2 JSONL session processing pipeline.
 
     Steps:
       1. Discover JSONL session files
       2. Filter and classify each session
-      3. (dry-run stops here — reports classification stats)
+      3. (dry-run mode=classify stops here — reports classification stats)
       4. Extract text from high-value sessions
       5. Cluster extractions by topic
       6. Synthesize wiki pages
+      6.5. (dry-run mode=diff stops here — prints unified diff vs disk)
       7. Write pages to vault
       8. Update MOC
       9. Record state
@@ -233,8 +267,11 @@ def run_session_pipeline(
                      len(classifications),
                      _classification_summary(classifications))
 
-        # Step 3: Dry run — report and exit
-        if dry_run:
+        # Step 3: Dry run — report and exit.
+        # v1.1.0: only classify-mode dry-run short-circuits here. diff-mode
+        # dry-runs fall through to extract + cluster + synthesize so the
+        # diff can be computed against the synthesized pages.
+        if dry_run and dry_run_mode != "diff":
             _print_dry_run_report(classifications)
             run.sessions_processed = len(classifications)
             return _finish_session_run(store, run, len(sessions),
@@ -253,17 +290,20 @@ def run_session_pipeline(
             all_extractions.extend(extractions)
             sessions_processed += 1
 
-            # Record session as processed
-            store.save_processed_session(
-                session_id=filtered_session.session_id,
-                project_path=filtered_session.project_dir,
-                file_path=filtered_session.file_path,
-                file_size=filtered_session.file_size,
-                message_count=len(filtered_session.messages),
-                pipeline_version=config.version,
-                classification=classification,
-                extraction_ids=[e.id for e in extractions],
-            )
+            # Record session as processed.
+            # v1.1.0: in diff-mode dry-run, skip the state row write so a
+            # re-run reproduces the same diff.
+            if dry_run_mode != "diff":
+                store.save_processed_session(
+                    session_id=filtered_session.session_id,
+                    project_path=filtered_session.project_dir,
+                    file_path=filtered_session.file_path,
+                    file_size=filtered_session.file_size,
+                    message_count=len(filtered_session.messages),
+                    pipeline_version=config.version,
+                    classification=classification,
+                    extraction_ids=[e.id for e in extractions],
+                )
 
         logger.info("Extracted %d chunks from %d sessions",
                      len(all_extractions), sessions_processed)
@@ -287,9 +327,25 @@ def run_session_pipeline(
         pages: list[WikiPage] = []
         for candidate in candidates:
             page = synthesize_page(
-                candidate, max_page_words=config.synthesis.max_page_words
+                candidate,
+                max_page_words=config.synthesis.max_page_words,
+                semantic_dedup_enabled=config.synthesis.semantic_dedup_enabled,
+                semantic_dedup_threshold=config.synthesis.semantic_dedup_threshold,
+                drift_check_enabled=config.synthesis.drift_check_enabled,
             )
             pages.append(page)
+
+        # v1.1.0: diff-mode dry-run short-circuits here.
+        # No vault writes, no MOC update, no extractions/wiki_pages rows.
+        if dry_run_mode == "diff":
+            _emit_diff_report(pages, config)
+            return {
+                "sessions_found": len(sessions),
+                "sessions_processed": sessions_processed,
+                "extractions": len(all_extractions),
+                "pages_created": 0,
+                "pages_updated": 0,
+            }
 
         # Step 7: Write pages to vault
         logger.info("=== Step 7: Writing wiki pages ===")
@@ -307,7 +363,7 @@ def run_session_pipeline(
 
         # Step 10: Record state
         logger.info("=== Step 10: Recording state ===")
-        store.save_extractions(all_extractions)
+        store.save_extractions(all_extractions, run_id_int=run.run_id_int)
         for page in pages:
             store.save_wiki_page(WikiPageRecord(
                 page_path=page.path,
@@ -316,6 +372,13 @@ def run_session_pipeline(
                 extraction_ids=page.extraction_ids,
                 word_count=page.word_count,
             ))
+
+        # Stamp every extraction seen this run with the current ordinal so
+        # the next prune sees them as confirmed. See run_memory_pipeline for
+        # the rationale on placement between save_extractions and finish_run.
+        store.touch_extractions(
+            [e.id for e in all_extractions], run.run_id_int
+        )
 
         pages_created = sum(1 for p in pages if p.is_new)
         pages_updated = sum(1 for p in pages if not p.is_new)
@@ -343,6 +406,16 @@ def run_session_pipeline(
 
     finally:
         store.close()
+
+
+def _emit_diff_report(pages: list[WikiPage], config: PipelineConfig) -> None:
+    """v1.1.0: render the diff between synthesized pages and on-disk vault.
+
+    Called from both pipelines when `--dry-run --dry-run-mode=diff` is set.
+    Pure I/O wrapper; the actual diff logic lives in `src/diff_report.py`.
+    """
+    logger.info("=== Diff-mode dry-run: rendering unified diffs ===")
+    print_diff_report(pages, config.vault.coding_notes)
 
 
 def _log_fix_summary(fix_report) -> None:
@@ -499,6 +572,20 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="Classify sessions only — report scores without processing",
     )
+    run_parser.add_argument(
+        "--dry-run-mode", choices=["classify", "diff"], default="classify",
+        help="With --dry-run: 'classify' (default, v1.0.0 behavior) or "
+             "'diff' (synthesize + print unified diff vs vault, no writes).",
+    )
+    run_parser.add_argument(
+        "--no-drift-check", action="store_true",
+        help="Disable the v1.1.0 LLM drift-detection pass on page merges.",
+    )
+    run_parser.add_argument(
+        "--no-semantic-dedup", action="store_true",
+        help="Disable the v1.1.0 semantic (paraphrase) dedup pass. "
+             "Pass-1 exact/prefix dedup still runs.",
+    )
 
     # status command
     sub.add_parser("status", help="Show pipeline status")
@@ -532,6 +619,27 @@ def main() -> None:
         help="Flag pages with fewer than this many words (default: 100)",
     )
 
+    # prune command (v1.1.0): drop stale extractions whose last_confirmed_run_id
+    # is older than --keep-runs runs back. Dry-run unless --apply.
+    prune_parser = sub.add_parser(
+        "prune",
+        help="Drop stale extractions older than --keep-runs runs (v1.1.0)",
+    )
+    prune_parser.add_argument(
+        "--keep-runs", type=int, default=None,
+        help="Number of recent runs that protect a row from pruning "
+             "(default: PruneConfig.default_keep_runs = 12)",
+    )
+    prune_parser.add_argument(
+        "--apply", action="store_true",
+        help="Actually delete; without this, prune is dry-run/report only",
+    )
+    prune_parser.add_argument(
+        "--rebuild", action="store_true",
+        help="With --apply: resynthesize affected pages from surviving "
+             "extractions (rewrites markdown).",
+    )
+
     args = parser.parse_args()
     config = PipelineConfig()
 
@@ -540,17 +648,39 @@ def main() -> None:
     set_domain_config(load_domain_config(config.paths.domains_config))
 
     if args.command == "run":
+        # v1.1.0: --dry-run-mode=diff requires --dry-run. argparse can't
+        # express this dependency directly, so validate here.
+        if args.dry_run_mode == "diff" and not args.dry_run:
+            run_parser.error("--dry-run-mode=diff requires --dry-run")
+
+        # v1.1.0: apply CLI overrides to SynthesisConfig (frozen dataclass:
+        # replace, don't mutate).
+        if args.no_drift_check or args.no_semantic_dedup:
+            from dataclasses import replace
+            config = replace(
+                config,
+                synthesis=replace(
+                    config.synthesis,
+                    drift_check_enabled=not args.no_drift_check,
+                    semantic_dedup_enabled=not args.no_semantic_dedup,
+                ),
+            )
+
+        dry_run_mode = args.dry_run_mode if args.dry_run else None
+
         if args.sources == "memory-only":
-            stats = run_memory_pipeline(config)
-            print(f"\nDone: {stats['extractions']} extractions → "
-                  f"{stats['pages_created']} new pages, "
-                  f"{stats['pages_updated']} updated pages")
+            stats = run_memory_pipeline(config, dry_run_mode=dry_run_mode)
+            if dry_run_mode != "diff":
+                print(f"\nDone: {stats['extractions']} extractions → "
+                      f"{stats['pages_created']} new pages, "
+                      f"{stats['pages_updated']} updated pages")
 
         elif args.sources == "sessions":
             stats = run_session_pipeline(
                 config,
                 project_filter=args.project,
                 dry_run=args.dry_run,
+                dry_run_mode=dry_run_mode,
             )
             if not args.dry_run:
                 print(f"\nDone: {stats['sessions_processed']} sessions → "
@@ -561,16 +691,18 @@ def main() -> None:
         elif args.sources == "all":
             # Run both pipelines sequentially
             print("=== Memory sources ===")
-            mem_stats = run_memory_pipeline(config)
-            print(f"Memory: {mem_stats['extractions']} extractions → "
-                  f"{mem_stats['pages_created']} new, "
-                  f"{mem_stats['pages_updated']} updated")
+            mem_stats = run_memory_pipeline(config, dry_run_mode=dry_run_mode)
+            if dry_run_mode != "diff":
+                print(f"Memory: {mem_stats['extractions']} extractions → "
+                      f"{mem_stats['pages_created']} new, "
+                      f"{mem_stats['pages_updated']} updated")
 
             print("\n=== Session sources ===")
             sess_stats = run_session_pipeline(
                 config,
                 project_filter=args.project,
                 dry_run=args.dry_run,
+                dry_run_mode=dry_run_mode,
             )
             if not args.dry_run:
                 print(f"Sessions: {sess_stats['sessions_processed']} sessions → "
@@ -596,6 +728,19 @@ def main() -> None:
             min_words=args.min_words,
         )
         print_fix_report(fix_report)
+
+    elif args.command == "prune":
+        try:
+            report = run_prune(
+                config,
+                keep_runs=args.keep_runs,
+                apply=args.apply,
+                rebuild=args.rebuild,
+            )
+        except RuntimeError as exc:
+            print(f"prune: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print(_format_prune_report(report, apply=args.apply))
 
     else:
         parser.print_help()

@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 
+from . import drift_check, embeddings
 from .clusterer import PageCandidate
 from .domains import get_domain_config
 from .state_store import Extraction
@@ -29,6 +30,12 @@ _TODAY = date.today().isoformat()
 # here as a literal so existing call-sites (and tests) that don't pass
 # max_page_words still get the guard.
 _DEFAULT_MAX_PAGE_WORDS = 3000
+
+# v1.1.0 defaults match SynthesisConfig defaults; kept here so callers that
+# don't pass a SynthesisConfig still get sensible behavior.
+_DEFAULT_SEMANTIC_DEDUP_ENABLED = True
+_DEFAULT_SEMANTIC_DEDUP_THRESHOLD = 0.86
+_DEFAULT_DRIFT_CHECK_ENABLED = True
 
 
 @dataclass
@@ -48,26 +55,59 @@ class WikiPage:
 def synthesize_page(
     candidate: PageCandidate,
     max_page_words: int = _DEFAULT_MAX_PAGE_WORDS,
+    *,
+    semantic_dedup_enabled: bool = _DEFAULT_SEMANTIC_DEDUP_ENABLED,
+    semantic_dedup_threshold: float = _DEFAULT_SEMANTIC_DEDUP_THRESHOLD,
+    drift_check_enabled: bool = _DEFAULT_DRIFT_CHECK_ENABLED,
 ) -> WikiPage:
     """Generate a WikiPage from a PageCandidate.
 
     For updates: integrates new extractions into the existing page body
     (additive only — no existing content is removed). If the existing body
     is already at or above max_page_words, new extractions are skipped and
-    logged so they surface in the next quality-check report.
-    For creates: generates a full page from scratch.
+    logged so they surface in the next quality-check report. v1.1.0: when
+    drift_check_enabled, a Claude call flags contradictions as HTML comments
+    inside the merged body.
+    For creates: generates a full page from scratch. v1.1.0: when
+    semantic_dedup_enabled and model2vec is installed, paraphrase-similar
+    extractions within the batch are collapsed.
     """
     if candidate.action == "update" and candidate.existing_content:
-        return _synthesize_update(candidate, max_page_words=max_page_words)
-    return _synthesize_new(candidate, max_page_words=max_page_words)
+        return _synthesize_update(
+            candidate,
+            max_page_words=max_page_words,
+            semantic_dedup_enabled=semantic_dedup_enabled,
+            semantic_dedup_threshold=semantic_dedup_threshold,
+            drift_check_enabled=drift_check_enabled,
+        )
+    return _synthesize_new(
+        candidate,
+        max_page_words=max_page_words,
+        semantic_dedup_enabled=semantic_dedup_enabled,
+        semantic_dedup_threshold=semantic_dedup_threshold,
+    )
 
 
 def _synthesize_new(
     candidate: PageCandidate,
     max_page_words: int = _DEFAULT_MAX_PAGE_WORDS,
+    *,
+    semantic_dedup_enabled: bool = _DEFAULT_SEMANTIC_DEDUP_ENABLED,
+    semantic_dedup_threshold: float = _DEFAULT_SEMANTIC_DEDUP_THRESHOLD,
 ) -> WikiPage:
-    """Build a brand-new wiki page from extractions."""
-    sections = _group_extractions_by_type(candidate.extractions)
+    """Build a brand-new wiki page from extractions.
+
+    v1.1.0: when semantic_dedup_enabled and model2vec is available, collapse
+    intra-batch paraphrases before grouping. No-op when the optional
+    dependency is missing -- v1.0.0 behavior preserved.
+    """
+    extractions_for_page = candidate.extractions
+    if semantic_dedup_enabled and len(extractions_for_page) > 1:
+        extractions_for_page = embeddings.intra_batch_dedup(
+            extractions_for_page, threshold=semantic_dedup_threshold,
+        )
+
+    sections = _group_extractions_by_type(extractions_for_page)
     body_parts: list[str] = []
     all_wikilinks: list[str] = []
 
@@ -118,7 +158,7 @@ def _synthesize_new(
         frontmatter=frontmatter,
         body=body,
         wikilinks=sorted(set(all_wikilinks)),
-        extraction_ids=[e.id for e in candidate.extractions],
+        extraction_ids=[e.id for e in extractions_for_page],
         word_count=word_count,
         is_new=True,
     )
@@ -127,6 +167,10 @@ def _synthesize_new(
 def _synthesize_update(
     candidate: PageCandidate,
     max_page_words: int = _DEFAULT_MAX_PAGE_WORDS,
+    *,
+    semantic_dedup_enabled: bool = _DEFAULT_SEMANTIC_DEDUP_ENABLED,
+    semantic_dedup_threshold: float = _DEFAULT_SEMANTIC_DEDUP_THRESHOLD,
+    drift_check_enabled: bool = _DEFAULT_DRIFT_CHECK_ENABLED,
 ) -> WikiPage:
     """Integrate new extractions into an existing page (additive only).
 
@@ -134,6 +178,13 @@ def _synthesize_update(
     refuse to grow it. The new extractions are skipped (NOT silently dropped —
     they're logged, and the existing body is returned unchanged). The next
     quality-check run will flag the page as oversized for manual split.
+
+    v1.1.0: semantic dedup pass after exact dedup catches paraphrases when
+    model2vec is installed. After dedup, a Claude drift check looks for
+    contradictions between surviving candidates and the existing body;
+    findings are injected as a single `<!-- DRIFT ... -->` block under the H1
+    of the merged body. Both passes are graceful no-ops when their backing
+    dependency is unavailable.
     """
     existing = candidate.existing_content
     all_wikilinks: list[str] = []
@@ -161,8 +212,16 @@ def _synthesize_update(
             is_new=False,
         )
 
-    # Deduplicate: skip extractions whose key content is already in the page
-    new_extractions = _deduplicate_extractions(candidate.extractions, existing_body)
+    # Deduplicate: skip extractions whose key content is already in the page.
+    # Pass 1 (always): exact + 120-char prefix + title match.
+    # Pass 2 (v1.1.0, opt-out + dep-gated): semantic similarity against the
+    # page body's H3/H2-chunked sections.
+    new_extractions = _deduplicate_extractions(
+        candidate.extractions,
+        existing_body,
+        semantic_enabled=semantic_dedup_enabled,
+        semantic_threshold=semantic_dedup_threshold,
+    )
 
     if not new_extractions:
         # Nothing new to add — return existing page as-is
@@ -177,8 +236,22 @@ def _synthesize_update(
             is_new=False,
         )
 
+    # v1.1.0: drift check. Ask Claude whether any surviving candidate
+    # contradicts the existing body. Findings are HTML-comment-annotated
+    # below the H1 so a human can review; new extractions still merge
+    # additively. Skip silently on any failure (no key, no SDK, API error).
+    drift_result = drift_check.check_drift(
+        existing_body, new_extractions, enabled=drift_check_enabled,
+    )
+    if drift_result.findings:
+        existing_body = _inject_drift_comment(
+            existing_body, drift_check.build_drift_comment(drift_result.findings),
+        )
+
     # Budget: how many words we can still add before hitting the cap.
-    word_budget = max(0, max_page_words - existing_word_count)
+    # Drift annotations are already in existing_body at this point, so the
+    # word budget naturally accounts for them.
+    word_budget = max(0, max_page_words - len(existing_body.split()))
 
     # Build an addendum section with new extractions, stopping when budget
     # is exhausted so a single synthesis pass can't blow past the cap.
@@ -316,16 +389,25 @@ def _normalize_for_compare(text: str) -> str:
 
 
 def _deduplicate_extractions(
-    new: list[Extraction], existing_body: str
+    new: list[Extraction],
+    existing_body: str,
+    *,
+    semantic_enabled: bool = _DEFAULT_SEMANTIC_DEDUP_ENABLED,
+    semantic_threshold: float = _DEFAULT_SEMANTIC_DEDUP_THRESHOLD,
 ) -> list[Extraction]:
     """Remove extractions whose key content is already in the page.
 
-    Stronger than first-60-chars: normalizes whitespace + uses 120-char
-    signature, falls back to title-match for long titles. Catches
-    near-duplicates from re-runs where minor whitespace differs.
+    Pass 1 (always): exact + 120-char prefix + title match (whitespace-
+    normalized). Catches re-runs of the same content even when minor
+    whitespace drifts between runs.
+
+    Pass 2 (v1.1.0, opt-out + dep-gated): when `semantic_enabled` and
+    `model2vec` is installed, drop new extractions whose cosine similarity
+    against any chunk of the existing body exceeds `semantic_threshold`.
+    Falls back to v1.0.0 behavior when the dependency is missing.
     """
     existing_norm = _normalize_for_compare(existing_body)
-    deduplicated = []
+    deduplicated: list[Extraction] = []
 
     for ext in new:
         content = ext.content.strip()
@@ -348,7 +430,47 @@ def _deduplicate_extractions(
 
         deduplicated.append(ext)
 
+    if semantic_enabled and deduplicated:
+        chunks = _chunk_body_for_embedding(existing_body)
+        if chunks:
+            deduplicated = embeddings.semantic_dedup_extractions(
+                deduplicated, chunks, threshold=semantic_threshold,
+            )
+
     return deduplicated
+
+
+def _chunk_body_for_embedding(body: str) -> list[str]:
+    """Split a page body into semantically meaningful chunks for embedding.
+
+    Splits on H2 (`## `) and H3 (`### `) markdown headings. Caps at the most
+    recent 50 chunks so the embedding matrix stays bounded on large pages.
+    Recent-section bias matches the drift-check truncation (drift is most
+    likely on newly-added content).
+    """
+    if not body:
+        return []
+    parts = re.split(r"\n(?=##+\s)", body)
+    cleaned = [p.strip() for p in parts if p.strip()]
+    if len(cleaned) > 50:
+        cleaned = cleaned[-50:]
+    return cleaned
+
+
+def _inject_drift_comment(body: str, comment_block: str) -> str:
+    """Insert a `<!-- DRIFT ... -->` block just below the H1 of `body`.
+
+    Idempotent insertion point: place the block immediately after the first
+    `\\n` that follows the H1 line. If no H1 is found, prepend to the body
+    so the comment is still visible.
+    """
+    if not comment_block:
+        return body
+    h1_match = re.search(r"^#\s.*\n", body, flags=re.MULTILINE)
+    if h1_match is None:
+        return comment_block + "\n\n" + body
+    insert_at = h1_match.end()
+    return body[:insert_at] + "\n" + comment_block + "\n" + body[insert_at:]
 
 
 # ---------------------------------------------------------------------------
